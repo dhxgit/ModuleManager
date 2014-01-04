@@ -27,6 +27,8 @@ namespace ModuleManager
 				print ("Searching node for " + nodeType + "[" + nodeName + "," + nodeTag + "]");
 #endif
             foreach (ConfigNode n in src.GetNodes(nodeType)) {
+                if (nodeName == null && nodeTag == null)
+                    return n;
                 if (n.HasValue("name") && WildcardMatch(n.GetValue("name"), nodeName) &&
                     (nodeTag == null ||
                     (n.HasValue("tag") && WildcardMatch(n.GetValue("tag"), nodeTag)))) {
@@ -54,6 +56,7 @@ namespace ModuleManager
         {   // Removes ALL whitespace of a string.
             return new string(withWhite.ToCharArray().Where(c => !Char.IsWhiteSpace(c)).ToArray());
         }
+
         // ModifyNode applies the ConfigNode mod as a 'patch' to ConfigNode original, then returns the patched ConfigNode.
         // it uses FindConfigNodeIn(src, nodeType, nodeName, nodeTag) to recurse.
         public static ConfigNode ModifyNode(ConfigNode original, ConfigNode mod)
@@ -89,12 +92,12 @@ namespace ModuleManager
 
             foreach (ConfigNode subMod in mod.nodes) {
                 subMod.name = RemoveWS(subMod.name);
-                if (subMod.name[0] != '@' && subMod.name[0] != '!')
+                if (subMod.name[0] != '@' && subMod.name[0] != '!' && subMod.name[0] != '%' && subMod.name[0] != '$')
                     newNode.AddNode(subMod);
                 else {
                     ConfigNode subNode;
-                    if (subMod.name[0] == '@')
-                        subNode = null;
+                    //if (subMod.name[0] == '@' && subMod.name[0] != '%')
+                    //    subNode = null;
 
                     if (subMod.name.Contains("[")) {
                         // format @NODETYPE[Name] {...} or @NODETYPE[Name, Tag] {...} or ! instead of @
@@ -110,7 +113,21 @@ namespace ModuleManager
                     } else {
                         // format @NODETYPE {...} or ! instead of @
                         string nodeType = subMod.name.Substring(1);
-                        subNode = newNode.GetNode(nodeType);
+
+                        // format @NODETYPE,N {...} or ! instead of @
+                        // The problem with ! is that the index is messed up
+                        // So the patch need to take that into account
+                        // and lower the index for the next search
+                        int index = 0;
+                        if (nodeType.Contains(",")) {
+                            int.TryParse(nodeType.Split(',')[1], out index);
+                            nodeType = nodeType.Split(',')[0];
+                        }
+                        ConfigNode[] subNodes = newNode.GetNodes(nodeType);
+                        if (subNodes.Length > index)
+                            subNode = subNodes[index];
+                        else
+                            subNode = null;
                     }
                     if (subMod.name[0] == '@') {
                         // find the original subnode to modify, modify it and add the modified.
@@ -120,8 +137,49 @@ namespace ModuleManager
                         } else
                             print("[ModuleManager] Could not find node to modify: " + subMod.name);
                     }
+                    if (subMod.name[0] == '%') {
+                        // if the original node exist add it
+                        if (subNode != null) {
+                            ConfigNode newSubNode = ModifyNode(subNode, subMod);
+                            newNode.nodes.Add(newSubNode);
+                        }
+                        else { // if not add the mod node without the % in its name                            
+                            // This part is messy. ialdabaoth is right, i need to rewrite.
+                            string type;
+                            string name;
+                            if (subMod.name.Contains("[")) {
+                                type = subMod.name.Substring(1).Split('[')[0];
+                                name = subMod.name.Split('[')[1].Replace("]", "");
+                            }
+                            else 
+                            {
+                                type = subMod.name.Substring(1);
+                                name = null;
+                            }
+                            
+                            ConfigNode copy = new ConfigNode(type);
+
+                            if (name != null)
+                                copy.AddValue("name", name);
+
+                            ConfigNode newSubNode = ModifyNode(copy, subMod);
+                            newNode.nodes.Add(newSubNode);                            
+                        }                            
+                    }
+                    if (subMod.name[0] == '$')
+                    {
+                        // find the original subnode to copy, add the original, add the the modified copy.
+                        if (subNode != null) {
+                            newNode.nodes.Add(subNode);
+                            ConfigNode newSubNode = ModifyNode(subNode, subMod);
+                            newNode.nodes.Add(newSubNode);
+                        }
+                        else
+                            print("[ModuleManager] Could not find node to copy: " + subMod.name);
+                    }
                     if (subNode != null)
                         newNode.nodes.Remove(subNode);
+
                 }
             }
             return newNode;
@@ -142,7 +200,7 @@ namespace ModuleManager
 
         int patchCount = 0;
 
-        public void Update()
+        public void OnGUI()
         {
             /* 
              * It should be a code to reload when the Reload Database debug button is used.
@@ -159,6 +217,8 @@ namespace ModuleManager
                 }
             }
              */
+
+                        
 
             if (!GameDatabase.Instance.IsReady() && ((HighLogic.LoadedScene == GameScenes.MAINMENU) || (HighLogic.LoadedScene == GameScenes.SPACECENTER)))
             {
@@ -237,6 +297,8 @@ namespace ModuleManager
 
             patchCount = 0;
 
+            ApplyNodesSwitch();
+
             ApplyPatch(excludePaths, false);
 
             // :Final node
@@ -250,30 +312,41 @@ namespace ModuleManager
         public void ApplyPatch(List<String> excludePaths, bool final)
         {
             foreach (UrlDir.UrlConfig mod in GameDatabase.Instance.root.AllConfigs) {
-                if (mod.type[0] == '@') {
+                if (mod.type[0] == '@' || (mod.type[0] == '$' )) {
                     try {
                         if (!final ^ mod.name.EndsWith(":Final")) {
                             char[] sep = new char[] { '[', ']' };
                             string name = RemoveWS(mod.name);
+                            string cond = "";
                             if (final)
                                 name = name.Substring(0, name.LastIndexOf(":Final"));
-                            string[] splits = name.Split(sep, 3);
-                            string pattern = splits[1];
-                            string type = splits[0].Substring(1);
 
-                            String cond = "";
-                            if (splits.Length > 2 && splits[2].Length > 5) {
-                                int start = splits[2].IndexOf("HAS[") + 4;
-                                cond = splits[2].Substring(start, splits[2].LastIndexOf(']') - start);
+                            if (name.Contains(":HAS[")) { 
+                                int start = name.IndexOf(":HAS[");
+                                cond = name.Substring(start + 5, name.LastIndexOf(']') - start - 5);
+                                name = name.Substring(0, start);
                             }
+
+                            string[] splits = name.Split(sep, 3);
+                            string pattern = splits.Length>1?splits[1]:null;
+                            string type = splits[0].Substring(1);                          
+
                             foreach (UrlDir.UrlConfig url in GameDatabase.Instance.root.AllConfigs) {
                                 if (url.type == type
                                     && WildcardMatch(url.name, pattern)
                                     && CheckCondition(url.config, cond)
                                     && !IsPathInList(mod.url, excludePaths)) {
-                                    print("[ModuleManager] Applying node " + mod.url + " to " + url.url);
-                                    patchCount++;
-                                    url.config = ConfigManager.ModifyNode(url.config, mod.config);
+                                        if (mod.type[0] == '@') {
+                                            print("[ModuleManager] Applying node " + mod.url + " to " + url.url);
+                                            patchCount++;
+                                            url.config = ConfigManager.ModifyNode(url.config, mod.config);
+                                        }
+                                        else {
+                                            // Here we would duplicate an Node if we had the mean to do it
+                                            //ConfigNode newNode = ConfigManager.ModifyNode(url.config, mod.config);
+                                            //UrlDir.UrlConfig newurl = new UrlDir.UrlConfig(mod.parent, newNode);
+                                            //print("[ModuleManager] Copying Node " + newurl.url + " " + newurl.name);
+                                        }                                    
                                 }
                             }
                         }
@@ -318,6 +391,8 @@ namespace ModuleManager
             if (condsList.Count == 1) {
                 conds = condsList[0];
 
+                
+
                 string remainCond = "";
                 if (conds.Contains("HAS[")) {
                     int start = conds.IndexOf("HAS[") + 4;
@@ -325,8 +400,10 @@ namespace ModuleManager
                     conds = conds.Substring(0, start - 5);
                 }
 
-                string type = conds.Substring(1).Split('[')[0];
-                string name = conds.Split('[')[1].Replace("]", "");
+                char[] sep = new char[] { '[', ']' };
+                string[] splits = conds.Split(sep, 3);
+                string type = splits[0].Substring(1);
+                string name = splits.Length > 1 ? splits[1] : null;
 
                 switch (conds[0]) {
                 case '@':
@@ -356,11 +433,79 @@ namespace ModuleManager
 
         public static bool WildcardMatch(String s, String wildcard)
         {
+            if (wildcard == null) return true;
             String pattern = "^" + Regex.Escape(wildcard).Replace(@"\*", ".*").Replace(@"\?", ".") + "$";
             Regex regex;
             regex = new Regex(pattern);
 
             return (regex.IsMatch(s));
+        }
+
+        public static void ApplyNodesSwitch()
+        {
+
+            log("Processing Node Switch. Avaiable DLL are "+ String.Join(" ", AssemblyLoader.loadedAssemblies.Select(a => a.assembly.GetName().Name).ToArray()));
+
+            foreach (UrlDir.UrlConfig url in GameDatabase.Instance.root.AllConfigs)
+            {
+                //log("processing " + url.name);
+                url.config = SearchNodesSwitch(url.config, url.type + " " + url.name);                    
+            }
+        }
+
+        public static ConfigNode SearchNodesSwitch(ConfigNode node, String rootName)
+        {
+            ConfigNode newNode = new ConfigNode(node.name);
+
+            foreach (ConfigNode.Value val in node.values)
+                newNode.AddValue(val.name, val.value);
+
+            foreach (ConfigNode child in node.nodes)
+            {
+                if (child.name == "MM_SWITCH")
+                {
+                    foreach (ConfigNode cas in child.nodes)
+                    {
+                        if (cas.name == "DEFAULT" || (cas.name == "CASE" && TestSwitchCase(cas)))
+                        {
+                            string list = "";
+                            foreach (ConfigNode.Value value in cas.values)
+                                list += " " + value.name + "=" + value.value;
+                            log("MM_SWITCH processed for " + rootName + " using " + cas.name + list);
+
+                            foreach (ConfigNode n in cas.nodes)
+                                newNode.AddNode(SearchNodesSwitch(n, rootName));
+                            
+                            break;
+                        }
+                    }
+                }
+                else
+                {
+                    newNode.nodes.Add(SearchNodesSwitch(child, rootName));
+                }
+            }
+            return newNode;
+        }
+
+        public static bool TestSwitchCase(ConfigNode node)
+        {
+            bool state = true;
+            foreach (ConfigNode.Value value in node.values) { 
+                // Switch case so we can extend the number of test easily
+                switch (value.name)
+                {
+                    case "dll_loaded":
+                        state = state && AssemblyLoader.loadedAssemblies.Any(a => a.assembly.GetName().Name == value.value);
+                        break;
+                }
+            }
+            return state;
+        }
+
+        public static void log(String s)
+        {
+            print("[ModuleManager] " + s);
         }
     }
 
